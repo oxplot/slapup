@@ -38,29 +38,42 @@ func (i connMapFlag) String() string {
 }
 
 func (i *connMapFlag) Set(value string) error {
-	parts := strings.SplitN(value, ":", 4)
-	if len(parts) != 4 {
+	parts := strings.SplitN(value, ":", 5)
+	var localHost, remoteHost string
+	var localPort, remotePort int
+	switch len(parts) {
+	case 2:
+		localHost = "127.0.0.1"
+		localPort, _ = strconv.Atoi(parts[0])
+		remoteHost = "127.0.0.1"
+		remotePort, _ = strconv.Atoi(parts[1])
+	case 3:
+		localHost = "127.0.0.1"
+		localPort, _ = strconv.Atoi(parts[0])
+		remoteHost = parts[1]
+		remotePort, _ = strconv.Atoi(parts[2])
+	case 4:
+		localHost = parts[0]
+		localPort, _ = strconv.Atoi(parts[1])
+		remoteHost = parts[2]
+		remotePort, _ = strconv.Atoi(parts[3])
+	default:
 		return fmt.Errorf("Invalid connection map: %s", value)
 	}
-	localPort, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return fmt.Errorf("Invalid local port: %s", parts[1])
-	}
-	remotePort, err := strconv.Atoi(parts[3])
-	if err != nil {
-		return fmt.Errorf("Invalid remote port: %s", parts[3])
+	if localPort == 0 || remotePort == 0 {
+		return fmt.Errorf("Invalid connection map: %s", value)
 	}
 	m := connMap{
-		localHost:  parts[0],
+		localHost:  localHost,
 		localPort:  localPort,
-		remoteHost: parts[2],
+		remoteHost: remoteHost,
 		remotePort: remotePort,
 	}
 	*i = append(*i, m)
 	return nil
 }
 
-func handleConnection(src net.Conn, dst net.Conn, done func()) {
+func handleConnection(src net.Conn, dst net.Conn) {
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	go func() {
@@ -76,7 +89,6 @@ func handleConnection(src net.Conn, dst net.Conn, done func()) {
 		io.Copy(dst, src)
 	}()
 	wg.Wait()
-	done()
 }
 
 func main() {
@@ -84,6 +96,7 @@ func main() {
 
 	var cm connMapFlag
 	flag.Var(&cm, "l", "localhost:port:remotehost:port")
+	onConn := flag.String("on-conn", "", "command to run on connection in shell - %h and %p will be replaced with host and port")
 	flag.Parse()
 	cmd := flag.Args()
 	if len(cm) == 0 {
@@ -168,26 +181,41 @@ func main() {
 		for {
 			select {
 			case spec := <-connSpecs:
-				procEnable <- true
-				var dst net.Conn
-				s := time.Now()
-				for time.Since(s) < 10*time.Second {
-					conn, err := net.Dial("tcp", spec.dst)
-					if err == nil {
-						dst = conn
-						break
+				go func() {
+					defer func() {
+						spec.src.Close()
+						done <- struct{}{}
+					}()
+					c := *onConn
+					if c != "" {
+						addr := spec.src.LocalAddr().(*net.TCPAddr)
+						c = strings.Replace(c, "%p", strconv.Itoa(addr.Port), -1)
+						c = strings.Replace(c, "%h", addr.IP.String(), -1)
+						cmd := exec.Command("/bin/sh", "-c", c)
+						if err := cmd.Run(); err != nil {
+							slog.Info("on-conn command failed", "err", err)
+							return
+						}
 					}
-					slog.Info("Could not connect", "err", err)
-					time.Sleep(100 * time.Millisecond)
-				}
-				if dst == nil {
-					slog.Info("Could not connect to destination")
-					spec.src.Close()
-					continue
-				}
-				go handleConnection(spec.src, dst, func() {
-					done <- struct{}{}
-				})
+					procEnable <- true
+					var dst net.Conn
+					s := time.Now()
+					for time.Since(s) < 10*time.Second {
+						conn, err := net.Dial("tcp", spec.dst)
+						if err == nil {
+							dst = conn
+							break
+						}
+						slog.Info("Could not connect", "err", err)
+						time.Sleep(100 * time.Millisecond)
+					}
+					if dst == nil {
+						slog.Info("Could not connect to destination")
+						return
+					}
+					defer dst.Close()
+					handleConnection(spec.src, dst)
+				}()
 				connected++
 				slog.Info("Connected", "count", connected)
 			case <-done:
